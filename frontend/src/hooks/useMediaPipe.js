@@ -17,9 +17,10 @@ function loadScript(src) {
   })
 }
 
-export function useMediaPipe({ videoRef, canvasRef, onPoseResult, enabled }) {
+export function useMediaPipe({ videoRef, canvasRef, onPoseResult, enabled, stream }) {
   const poseRef   = useRef(null)
   const cameraRef = useRef(null)
+  const frameLoopRef = useRef(null)
   const [ready, setReady] = useState(false)
   const [error, setError] = useState(null)
 
@@ -50,11 +51,20 @@ export function useMediaPipe({ videoRef, canvasRef, onPoseResult, enabled }) {
   useEffect(() => {
     if (!enabled) return
     let cancelled = false
+
+    const cancelFrameLoop = () => {
+      if (frameLoopRef.current) {
+        cancelAnimationFrame(frameLoopRef.current)
+        frameLoopRef.current = null
+      }
+    }
+
     async function init() {
       try {
         await loadScript(`${POSE_CDN}/pose.js`)
         await loadScript(`${CAM_CDN}/camera_utils.js`)
         if (cancelled) return
+
         const pose = new window.Pose({
           locateFile: (f) => `${POSE_CDN}/${f}`,
         })
@@ -74,29 +84,62 @@ export function useMediaPipe({ videoRef, canvasRef, onPoseResult, enabled }) {
           onPoseResult(lm || null)
         })
         poseRef.current = pose
-        const camera = new window.Camera(videoRef.current, {
-          onFrame: async () => {
-            if (poseRef.current && videoRef.current)
-              await poseRef.current.send({ image: videoRef.current })
-          },
-          width: 640, height: 480,
-        })
-        await camera.start()
-        cameraRef.current = camera
+
+        if (stream && videoRef.current) {
+          videoRef.current.srcObject = stream
+          videoRef.current.onloadedmetadata = () => {
+            videoRef.current?.play().catch(() => {})
+          }
+          const tick = async () => {
+            if (cancelled || !poseRef.current || !videoRef.current) return
+            try {
+              if (videoRef.current.readyState >= 2) {
+                await poseRef.current.send({ image: videoRef.current })
+              }
+            } catch {
+              // Ignore frame-send errors while the stream is settling.
+            }
+            if (!cancelled) {
+              frameLoopRef.current = requestAnimationFrame(() => {
+                tick()
+              })
+            }
+          }
+          frameLoopRef.current = requestAnimationFrame(() => {
+            tick()
+          })
+          cameraRef.current = {
+            stop: cancelFrameLoop,
+          }
+        } else {
+          const camera = new window.Camera(videoRef.current, {
+            onFrame: async () => {
+              if (poseRef.current && videoRef.current) {
+                await poseRef.current.send({ image: videoRef.current })
+              }
+            },
+            width: 640, height: 480,
+          })
+          await camera.start()
+          cameraRef.current = camera
+        }
+
         if (!cancelled) setReady(true)
       } catch (err) {
         if (!cancelled) setError(err.message || 'Failed to load MediaPipe')
       }
     }
+
     init()
     return () => {
       cancelled = true
+      cancelFrameLoop()
       cameraRef.current?.stop()
       poseRef.current?.close()
       poseRef.current = null; cameraRef.current = null
       setReady(false)
     }
-  }, [enabled, videoRef, canvasRef, onPoseResult, drawSkeleton])
+  }, [enabled, videoRef, canvasRef, onPoseResult, drawSkeleton, stream])
 
   return { ready, error }
 }

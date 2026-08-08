@@ -14,7 +14,6 @@ import {
 } from 'chart.js'
 import { useMediaPipe } from '../hooks/useMediaPipe'
 import { calculateAngle, extractJoints, computeSessionStats } from '../utils/angleUtils'
-import rehabApi from '../utils/rehabApi'
 import { useTheme } from '../context/ThemeContext'
 
 ChartJS.register(LineElement, PointElement, LinearScale, CategoryScale, Filler, Tooltip, Legend)
@@ -250,9 +249,7 @@ export default function MonitoringSession({ patient, onSessionComplete }) {
   const [currentAngle, setAngle] = useState(null)
   const [liveAngles, setLive] = useState([])
   const [summary, setSummary] = useState(null)
-  const [backendSession, setBS] = useState(null)
-  const [submitting, setSubmitting] = useState(false)
-  const [apiError, setApiError] = useState('')
+  const [feedback, setFeedback] = useState('Position your arm in view')
   const [showGuide, setShowGuide] = useState(false)
   const [isMaximized, setMaximized] = useState(false)
   const [showGrid, setShowGrid] = useState(true)
@@ -268,6 +265,8 @@ export default function MonitoringSession({ patient, onSessionComplete }) {
   const startTimeRef = useRef(null)
   const angleBufferRef = useRef([])
   const streamRef = useRef(null)
+  const prevAnglesRef = useRef([])
+  const target = patient?.target_angle || TARGET
 
   // Detect mobile and set default camera
   useEffect(() => {
@@ -379,16 +378,44 @@ export default function MonitoringSession({ patient, onSessionComplete }) {
     const joints = extractJoints(landmarks)
     if (!joints) return
     const angle = calculateAngle(joints.shoulder, joints.elbow, joints.wrist)
+    const wrist = joints.wrist
+    const shoulder = joints.shoulder
+    const prevAngles = prevAnglesRef.current
+    const delta = prevAngles.length ? Math.abs(angle - prevAngles[prevAngles.length - 1]) : 0
+    const wristAboveShoulder = wrist.y < shoulder.y - 0.08
+    const wristBelowShoulder = wrist.y > shoulder.y + 0.08
+
+    let nextFeedback = 'Move correctly'
+    if (delta > 20) {
+      nextFeedback = 'Slow down'
+    } else if (wristBelowShoulder) {
+      nextFeedback = 'Raise your arm higher'
+    } else if (angle < target - 30) {
+      nextFeedback = 'Keep your elbow straight'
+    } else if (angle <= target + 15 && angle >= target - 15) {
+      nextFeedback = delta < 10 ? 'Good movement' : 'Move correctly'
+    } else if (angle > target + 25) {
+      nextFeedback = 'Lower your arm slightly'
+    } else {
+      nextFeedback = 'Move correctly'
+    }
+
+    prevAngles.push(angle)
+    if (prevAngles.length > 30) prevAngles.shift()
+    prevAnglesRef.current = prevAngles
+
+    setFeedback(nextFeedback)
     setAngle(angle)
     const t = (Date.now() - startTimeRef.current) / 1000
     const point = { t: Math.round(t * 10) / 10, angle }
     angleBufferRef.current.push(point)
     setLive(prev => [...prev.slice(-89), point])
-  }, [phase])
+  }, [phase, target])
 
   const { ready: poseReady, error: poseError } = useMediaPipe({
     videoRef, canvasRef, onPoseResult,
     enabled: phase === 'monitoring',
+    stream: streamRef.current,
   })
 
   /* ── Countdown 3-2-1 ── */
@@ -400,7 +427,8 @@ export default function MonitoringSession({ patient, onSessionComplete }) {
       if (n <= 0) {
         clearInterval(id)
         setCountdown(null)
-        setLive([]); setSummary(null); setBS(null); setApiError(''); setAngle(null)
+        setLive([]); setSummary(null); setFeedback('Position your arm in view'); setAngle(null)
+        prevAnglesRef.current = []
         setPhase('monitoring')
       } else {
         setCountdown(n)
@@ -435,33 +463,17 @@ export default function MonitoringSession({ patient, onSessionComplete }) {
 
   const _finishSession = useCallback(() => {
     const collected = [...angleBufferRef.current]
-    const stats = computeSessionStats(collected.map(p => p.angle), patient?.target_angle || TARGET)
+    const stats = computeSessionStats(collected.map(p => p.angle), target)
     setSummary({ ...stats, series: collected })
     setPhase('complete')
     stopStream()
-    _submitToBackend(collected)
-  }, [patient, stopStream])
-
-  const _submitToBackend = async (series) => {
-    if (!patient?.rehab_patient_id) return
-    setSubmitting(true); setApiError('')
-    try {
-      const { data } = await rehabApi.post('/api/sessions/submit', {
-        patient_id: patient.rehab_patient_id,
-        angle_series: series,
-        duration_secs: DURATION,
-        doctor_notes: '',
-      })
-      setBS(data); onSessionComplete?.(data)
-    } catch (err) {
-      setApiError(err.response?.data?.detail || 'Failed to save session.')
-    } finally { setSubmitting(false) }
-  }
+    onSessionComplete?.({ ...stats, series: collected })
+  }, [stopStream, target, onSessionComplete])
 
   const reset = () => {
     clearInterval(timerRef.current)
     stopStream()
-    setPhase('idle'); setLive([]); setSummary(null); setAngle(null)
+    setPhase('idle'); setLive([]); setSummary(null); setAngle(null); setFeedback('Position your arm in view')
     setMaximized(false); setCountdown(null); setCameraError('')
     setShowMobileStats(false)
     setFacingMode(isMobile ? 'environment' : 'user')
@@ -479,7 +491,6 @@ export default function MonitoringSession({ patient, onSessionComplete }) {
   const timerPct = ((DURATION - timeLeft) / DURATION) * 100
   const r = isMobile ? 36 : 46
   const circ = 2 * Math.PI * r
-  const target = patient?.target_angle || TARGET
   const angleColor = currentAngle === null ? 'var(--text-muted)'
     : currentAngle >= target ? '#34d399'
       : currentAngle >= target * 0.7 ? '#fbbf24'
@@ -771,10 +782,10 @@ export default function MonitoringSession({ patient, onSessionComplete }) {
                 </div>
                 <div style={{ padding: '0 16px' }}>
                   {[
-                    ['Patient', patient?.name || '—'],
+                    ['Patient', patient?.name || 'Guest'],
                     ['Target Angle', `${target}°`],
                     ['Duration', `${DURATION} seconds`],
-                    ['Report', 'Auto-sent to doctor'],
+                    ['Session', 'Live feedback only'],
                   ].map(([k, v], i, arr) => (
                     <div key={k} style={{
                       display: 'flex', justifyContent: 'space-between', alignItems: 'center',
@@ -805,35 +816,24 @@ export default function MonitoringSession({ patient, onSessionComplete }) {
                   )}
                   <button
                     onClick={() => startCamera()}
-                    disabled={!patient?.rehab_patient_id}
                     style={{
                       width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
                       padding: isMobile ? '12px 0' : '14px 0',
-                      background: patient?.rehab_patient_id
-                        ? 'linear-gradient(135deg, #1d4ed8, #2563EB)'
-                        : 'var(--bg-card2)',
-                      color: patient?.rehab_patient_id ? '#fff' : 'var(--text-muted)',
+                      background: 'linear-gradient(135deg, #1d4ed8, #2563EB)',
+                      color: '#fff',
                       border: 'none', borderRadius: 12, 
                       fontSize: isMobile ? 14 : 15, 
                       fontWeight: 700,
-                      cursor: patient?.rehab_patient_id ? 'pointer' : 'not-allowed',
+                      cursor: 'pointer',
                       fontFamily: 'inherit',
-                      boxShadow: patient?.rehab_patient_id
-                        ? '0 4px 20px rgba(37,99,235,0.35)'
-                        : 'none',
+                      boxShadow: '0 4px 20px rgba(37,99,235,0.35)',
                       transition: 'all 0.2s',
-                      opacity: patient?.rehab_patient_id ? 1 : 0.5,
                       letterSpacing: '0.01em',
                     }}
                   >
                     <IconCamera size={isMobile ? 16 : 18} color="currentColor" />
                     Start Camera {isMobile && '(Back Camera)'}
                   </button>
-                  {!patient?.rehab_patient_id && (
-                    <p style={{ textAlign: 'center', fontSize: 11, color: 'var(--text-muted)', margin: '8px 0 0' }}>
-                      Rehab profile required.
-                    </p>
-                  )}
                 </div>
               </div>
 
@@ -846,7 +846,7 @@ export default function MonitoringSession({ patient, onSessionComplete }) {
                 <p style={{ margin: '0 0 10px', fontSize: 10, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#2563EB' }}>
                   Camera Tips
                 </p>
-                {['Ensure good lighting on your arm', 'Wear a fitted sleeve or roll it up', 'Keep your body centered in frame', 'Avoid fast or jerky movements'].map((t, i) => (
+                {['Ensure good lighting on your arm', 'Wear a fitted sleeve or roll it up', 'Keep your body centered in frame', 'Keep your wrist and hand visible', 'Avoid fast or jerky movements'].map((t, i) => (
                   <div key={i} style={{ 
                     display: 'flex', alignItems: 'center', gap: 8, 
                     fontSize: isMobile ? 11 : 12, 
@@ -1278,6 +1278,42 @@ export default function MonitoringSession({ patient, onSessionComplete }) {
                         </div>
                       </>
                     )}
+                  </div>
+                )}
+
+                {/* Live feedback text */}
+                {phase === 'monitoring' && (
+                  <div style={{
+                    position: 'absolute',
+                    bottom: isMobile ? 88 : 110,
+                    left: isMobile ? 12 : 16,
+                    right: isMobile ? 12 : 'auto',
+                    background: 'rgba(15,23,42,0.85)',
+                    border: `1px solid rgba(255,255,255,0.14)`, 
+                    borderRadius: 16,
+                    padding: isMobile ? '10px 14px' : '12px 16px',
+                    zIndex: 10,
+                    backdropFilter: 'blur(10px)',
+                    maxWidth: isMaximized ? 'calc(100% - 32px)' : 320,
+                  }}>
+                    <div style={{
+                      fontSize: isMobile ? 10 : 11,
+                      fontWeight: 700,
+                      letterSpacing: '0.12em',
+                      textTransform: 'uppercase',
+                      color: '#93C5FD',
+                      marginBottom: 4,
+                    }}>
+                      Live Feedback
+                    </div>
+                    <div style={{
+                      fontSize: isMobile ? 14 : 15,
+                      fontWeight: 700,
+                      color: '#fff',
+                      lineHeight: 1.3,
+                    }}>
+                      {feedback}
+                    </div>
                   </div>
                 )}
 
@@ -1759,37 +1795,7 @@ export default function MonitoringSession({ patient, onSessionComplete }) {
             <p style={{ margin: '0 0 14px', color: 'var(--text-muted)', fontSize: isMobile ? 12 : 13 }}>
               {DURATION}-second session · {summary.count} frames collected
             </p>
-            {backendSession && <StatusBadge status={backendSession.injury_status} />}
           </div>
-
-          {/* Status banner */}
-          {backendSession && (() => {
-            const c = STATUS_CFG[backendSession.injury_status] || STATUS_CFG.stable
-            return (
-              <div style={{
-                borderRadius: 14, padding: isMobile ? '14px 18px' : '18px 24px',
-                border: `1px solid ${c.border}`, background: c.bg,
-                display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16,
-                flexWrap: isMobile ? 'wrap' : 'nowrap',
-              }}>
-                <div>
-                  <p style={{ margin: 0, fontWeight: 700, fontSize: isMobile ? 14 : 15, color: c.color }}>{c.label}</p>
-                  <p style={{ margin: '4px 0 0', color: 'var(--text-muted)', fontSize: isMobile ? 12 : 13 }}>
-                    {backendSession.angle_delta !== 0
-                      ? `${backendSession.angle_delta > 0 ? '+' : ''}${backendSession.angle_delta}° change from last session`
-                      : 'First session — baseline established'}
-                  </p>
-                </div>
-                <span style={{
-                  fontSize: isMobile ? 28 : 36, fontWeight: 700,
-                  fontFamily: "'JetBrains Mono', monospace", color: c.color,
-                }}>
-                  {backendSession.angle_delta > 0 ? '+' : ''}{backendSession.angle_delta}°
-                </span>
-              </div>
-            )
-          })()}
-
           {/* Metrics grid - mobile: 2 columns, desktop: 3 */}
           <div style={{ 
             display: 'grid', 
@@ -1855,40 +1861,6 @@ export default function MonitoringSession({ patient, onSessionComplete }) {
             alignItems: 'center',
             flexDirection: isMobile ? 'column' : 'row',
           }}>
-            {submitting && (
-              <span style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text-muted)' }}>
-                <Spinner size={16} /> Saving session and generating report…
-              </span>
-            )}
-            {apiError && (
-              <div style={{
-                width: '100%',
-                background: 'var(--danger-bg)', border: '1px solid var(--danger-border)',
-                color: 'var(--danger)', borderRadius: 12, padding: '12px 16px', fontSize: 13,
-              }}>
-                {apiError}
-              </div>
-            )}
-            {backendSession?.pdf_path && !submitting && (
-              <a
-                href={`/rehab/outputs/reports/${backendSession.pdf_path.split('/').pop()}`}
-                download target="_blank" rel="noreferrer"
-                style={{
-                  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                  gap: 8,
-                  padding: isMobile ? '12px 18px' : '12px 22px',
-                  background: 'linear-gradient(135deg, #1d4ed8, #2563EB)',
-                  color: '#fff', borderRadius: 12, 
-                  fontSize: isMobile ? 14 : 14, 
-                  fontWeight: 600,
-                  textDecoration: 'none',
-                  boxShadow: '0 4px 16px rgba(37,99,235,0.35)',
-                  width: isMobile ? '100%' : 'auto',
-                }}
-              >
-                <IconDownload size={isMobile ? 14 : 15} color="#fff" /> Download PDF Report
-              </a>
-            )}
             <button
               onClick={reset}
               style={{

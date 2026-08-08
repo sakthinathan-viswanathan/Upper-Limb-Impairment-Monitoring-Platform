@@ -15,6 +15,9 @@ Run:
 """
 
 import os
+from contextlib import asynccontextmanager
+
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,11 +45,30 @@ os.makedirs("outputs/graphs", exist_ok=True)
 os.makedirs("outputs/reports", exist_ok=True)
 os.makedirs("outputs/verifications", exist_ok=True)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db = SessionLocal()
+    try:
+        # Seed a default admin only when explicitly enabled via env var.
+        # This prevents accidental exposure of default credentials in production.
+        seed_allowed = os.environ.get("SEED_DEFAULT_ADMIN", "false").lower() in ("1", "true", "yes")
+        if seed_allowed and not db.query(User).filter_by(role="admin").first():
+            admin = User(name="System Admin", email="admin@healthcare.dev", role="admin")
+            admin.password = "Admin@1234"
+            db.add(admin)
+            db.commit()
+            print("Default admin seeded -> admin@healthcare.dev / Admin@1234")
+    finally:
+        db.close()
+    yield
+
+
 app = FastAPI(
     title="Upper Limb Impairment Monitoring Platform API",
     description="Single consolidated FastAPI backend: auth, users, messaging, "
                  "appointments, notifications and rehab session monitoring.",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
@@ -106,20 +128,17 @@ app.include_router(verification.router, prefix="/api", tags=["Verification"])
 def health():
     return {"status": "ok", "service": "Upper Limb Impairment Monitoring Platform API v2.0"}
 
+if __name__ == "__main__":
+    HOST = os.environ.get("HOST", "0.0.0.0")
 
-# ── Seed a default admin on first run (mirrors the old Flask behaviour) ──────
-@app.on_event("startup")
-def seed_default_admin():
-    db = SessionLocal()
-    try:
-        # Seed a default admin only when explicitly enabled via env var.
-        # This prevents accidental exposure of default credentials in production.
-        seed_allowed = os.environ.get("SEED_DEFAULT_ADMIN", "false").lower() in ("1", "true", "yes")
-        if seed_allowed and not db.query(User).filter_by(role="admin").first():
-            admin = User(name="System Admin", email="admin@healthcare.dev", role="admin")
-            admin.password = "Admin@1234"
-            db.add(admin)
-            db.commit()
-            print("Default admin seeded -> admin@healthcare.dev / Admin@1234")
-    finally:
-        db.close()
+    # Default to the same port used by the frontend Vite proxy.
+    PORT = int(os.environ.get("PORT", "8000"))
+
+    print(f"Starting FastAPI server on http://{HOST}:{PORT}")
+
+    uvicorn.run(
+        "main:app",
+        host=HOST,
+        port=PORT,
+        reload=True,
+    )
